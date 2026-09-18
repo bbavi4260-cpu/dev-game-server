@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: test-chess-private-server
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 --threads 4 --timeout 120 server:app
+    healthCheckPath: /

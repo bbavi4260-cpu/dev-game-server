@@ -1,0 +1,196 @@
+[1mdiff --git a/requirements.txt b/requirements.txt[m
+[1mindex 481398c..49a16ab 100644[m
+[1m--- a/requirements.txt[m
+[1m+++ b/requirements.txt[m
+[36m@@ -3,3 +3,4 @@[m [mflask-cors[m
+ flask-sock[m
+ python-chess[m
+ gunicorn[m
+[32m+[m[32mpytest[m
+[1mdiff --git a/server.py b/server.py[m
+[1mindex 3387c66..c511d37 100644[m
+[1m--- a/server.py[m
+[1m+++ b/server.py[m
+[36m@@ -1,6 +1,8 @@[m
+ import json[m
+ import os[m
+ import random[m
+[32m+[m[32mimport sqlite3[m
+[32m+[m[32mimport threading[m
+ import time[m
+ import uuid[m
+ import chess[m
+[36m@@ -18,6 +20,91 @@[m [mMATCHMAKING_QUEUE = {}[m
+ USERS = {}[m
+ SESSIONS = {}[m
+ NEXT_USER_ID = 1000001[m
+[32m+[m[32mSTATE_LOCK = threading.RLock()[m
+[32m+[m[32mDB_PATH = os.environ.get("CHESS_DB_PATH", os.path.join(os.path.dirname(__file__), "chess.db"))[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _db_connect():[m
+[32m+[m[32m    connection = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)[m
+[32m+[m[32m    connection.row_factory = sqlite3.Row[m
+[32m+[m[32m    connection.execute("PRAGMA journal_mode=WAL")[m
+[32m+[m[32m    connection.execute("PRAGMA busy_timeout=30000")[m
+[32m+[m[32m    return connection[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _db_init():[m
+[32m+[m[32m    with _db_connect() as db:[m
+[32m+[m[32m        db.executescript("""[m
+[32m+[m[32m            CREATE TABLE IF NOT EXISTS users ([m
+[32m+[m[32m                id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,[m
+[32m+[m[32m                email TEXT NOT NULL DEFAULT '', avatar TEXT NOT NULL DEFAULT '', password TEXT NOT NULL DEFAULT ''[m
+[32m+[m[32m            );[m
+[32m+[m[32m            CREATE TABLE IF NOT EXISTS rooms ([m
+[32m+[m[32m                room_code TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at REAL NOT NULL[m
+[32m+[m[32m            );[m
+[32m+[m[32m            CREATE TABLE IF NOT EXISTS games ([m
+[32m+[m[32m                game_id TEXT PRIMARY KEY, payload TEXT NOT NULL, fen TEXT NOT NULL,[m
+[32m+[m[32m                status TEXT NOT NULL, updated_at REAL NOT NULL[m
+[32m+[m[32m            );[m
+[32m+[m[32m            CREATE TABLE IF NOT EXISTS matchmaking_queue ([m
+[32m+[m[32m                player_id TEXT PRIMARY KEY, payload TEXT NOT NULL, queued_at REAL NOT NULL[m
+[32m+[m[32m            );[m
+[32m+[m[32m        """)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _load_state():[m
+[32m+[m[32m    global NEXT_USER_ID[m
+[32m+[m[32m    _db_init()[m
+[32m+[m[32m    with _db_connect() as db:[m
+[32m+[m[32m        for row in db.execute("SELECT * FROM users"):[m
+[32m+[m[32m            USERS[row["username"].lower()] = dict(row)[m
+[32m+[m[32m        for row in db.execute("SELECT room_code, payload FROM rooms"):[m
+[32m+[m[32m            ROOMS[row["room_code"]] = json.loads(row["payload"])[m
+[32m+[m[32m        for row in db.execute("SELECT game_id, payload, fen FROM games"):[m
+[32m+[m[32m            game = json.loads(row["payload"])[m
+[32m+[m[32m            game["board"] = chess.Board(row["fen"])[m
+[32m+[m[32m            GAMES[row["game_id"]] = game[m
+[32m+[m[32m        for row in db.execute("SELECT player_id, payload FROM matchmaking_queue"):[m
+[32m+[m[32m            MATCHMAKING_QUEUE[row["player_id"]] = json.loads(row["payload"])[m
+[32m+[m[32m    if USERS:[m
+[32m+[m[32m        NEXT_USER_ID = max(int(user["id"]) for user in USERS.values()) + 1[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _json_game(game):[m
+[32m+[m[32m    return {key: value for key, value in game.items() if key != "board"}[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _persist_user(user):[m
+[32m+[m[32m    with _db_connect() as db:[m
+[32m+[m[32m        db.execute("INSERT OR REPLACE INTO users(id, username, email, avatar, password) VALUES (?, ?, ?, ?, ?)",[m
+[32m+[m[32m                   (user["id"], user["username"], user.get("email", ""), user.get("avatar", ""), user.get("password", "")))[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _persist_game(game_id):[m
+[32m+[m[32m    game = GAMES.get(game_id)[m
+[32m+[m[32m    if not game:[m
+[32m+[m[32m        return[m
+[32m+[m[32m    with _db_connect() as db:[m
+[32m+[m[32m        db.execute("INSERT OR REPLACE INTO games(game_id, payload, fen, status, updated_at) VALUES (?, ?, ?, ?, ?)",[m
+[32m+[m[32m                   (game_id, json.dumps(_json_game(game)), game["board"].fen(), game.get("status", "active"), time.time()))[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _persist_room(room):[m
+[32m+[m[32m    with _db_connect() as db:[m
+[32m+[m[32m        db.execute("INSERT OR REPLACE INTO rooms(room_code, payload, created_at) VALUES (?, ?, ?)",[m
+[32m+[m[32m                   (room["room_code"], json.dumps(room), room.get("created_at", time.time())))[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _persist_queue(player_id, player=None):[m
+[32m+[m[32m    with _db_connect() as db:[m
+[32m+[m[32m        if player is None:[m
+[32m+[m[32m            db.execute("DELETE FROM matchmaking_queue WHERE player_id = ?", (player_id,))[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            db.execute("INSERT OR REPLACE INTO matchmaking_queue(player_id, payload, queued_at) VALUES (?, ?, ?)",[m
+[32m+[m[32m                       (player_id, json.dumps(player), player.get("queued_at", time.time())))[m
+[32m+[m
+[32m+[m
+[32m+[m[32m_load_state()[m
+ [m
+ FAKE_PLAYERS = [[m
+     {"username": "GrandmasterFlex", "rating": 1540, "country": "US"},[m
+[36m@@ -135,6 +222,7 @@[m [mdef _create_user(data, guest=False):[m
+     token = f"session_{uuid.uuid4().hex}"[m
+     USERS[key] = user[m
+     SESSIONS[token] = user["id"][m
+[32m+[m[32m    _persist_user(user)[m
+     return jsonify(_auth_payload(user, token)), 200[m
+ [m
+ [m
+[36m@@ -598,6 +686,9 @@[m [mdef _create_custom_room():[m
+     GAMES[game_id]["room_id"] = room_code[m
+     GAMES[game_id]["status"] = "waiting"[m
+     ROOMS[room_code] = room[m
+[32m+[m[32m    with STATE_LOCK:[m
+[32m+[m[32m        _persist_game(game_id)[m
+[32m+[m[32m        _persist_room(room)[m
+     return jsonify(_room_payload(room)), 200[m
+ [m
+ [m
+[36m@@ -616,6 +707,9 @@[m [mdef _join_custom_room(room_code=None):[m
+     game = GAMES.get(room["game_id"])[m
+     if game:[m
+         game["status"] = "active"[m
+[32m+[m[32m        with STATE_LOCK:[m
+[32m+[m[32m            _persist_game(room["game_id"])[m
+[32m+[m[32m            _persist_room(room)[m
+     return jsonify(_room_payload(room)), 200[m
+ [m
+ [m
+[36m@@ -695,12 +789,16 @@[m [mdef _queue_match_response(player_id, player):[m
+                         candidate["time_control"] == player["time_control"]), None)[m
+     if opponent_id is None:[m
+         MATCHMAKING_QUEUE[player_id] = player[m
+[32m+[m[32m        with STATE_LOCK:[m
+[32m+[m[32m            _persist_queue(player_id, player)[m
+         return jsonify({"code": 0, "status": "searching", "success": True,[m
+                         "matched": False, "queue_id": player_id,[m
+                         "data": {"status": "searching", "matched": False,[m
+                                   "queue_id": player_id}}), 200[m
+ [m
+     opponent = MATCHMAKING_QUEUE.pop(opponent_id)[m
+[32m+[m[32m    with STATE_LOCK:[m
+[32m+[m[32m        _persist_queue(opponent_id)[m
+     game_id = str(uuid.uuid4())[:8][m
+     player_color = random.choice(["white", "black"])[m
+     GAMES[game_id] = {[m
+[36m@@ -708,6 +806,8 @@[m [mdef _queue_match_response(player_id, player):[m
+         "color": player_color, "time_control": player["time_control"],[m
+         "opponent": opponent, "players": [player, opponent],[m
+     }[m
+[32m+[m[32m    with STATE_LOCK:[m
+[32m+[m[32m        _persist_game(game_id)[m
+     payload = {"code": 0, "status": "matched", "success": True, "matched": True,[m
+                "game_id": game_id, "gameId": game_id, "id": game_id,[m
+                "opponent": opponent, "player": {"color": player_color},[m
+[36m@@ -746,6 +846,9 @@[m [mdef cancel_matchmaking_queue():[m
+                     data.get("username") or data.get("userName") or[m
+                     request.args.get("user_id") or "guest")[m
+     removed = MATCHMAKING_QUEUE.pop(player_id, None) is not None[m
+[32m+[m[32m    if removed:[m
+[32m+[m[32m        with STATE_LOCK:[m
+[32m+[m[32m            _persist_queue(player_id)[m
+     return jsonify({"code": 0, "status": "cancelled", "success": True,[m
+                     "removed": removed, "data": {"cancelled": True,[m
+                     "removed": removed}}), 200[m
+[36m@@ -837,6 +940,8 @@[m [mdef play_move(game_id):[m
+         return jsonify({"code": 400, "status": "error", "message": "Illegal move"}), 400[m
+ [m
+     board.push(move)[m
+[32m+[m[32m    with STATE_LOCK:[m
+[32m+[m[32m        _persist_game(game_id)[m
+     return jsonify({[m
+         "code": 0,[m
+         "status": "ok",[m
+[36m@@ -960,6 +1065,8 @@[m [mdef live_websocket(ws, game_id):[m
+                     move = chess.Move.from_uci(move_uci)[m
+                     if move in board.legal_moves:[m
+                         board.push(move)[m
+[32m+[m[32m                        with STATE_LOCK:[m
+[32m+[m[32m                            _persist_game(game_id)[m
+                         ws.send(json.dumps({"event": "move_played", "fen": board.fen()}))[m
+                     else:[m
+                         ws.send(json.dumps({"event": "error", "message": "Illegal move"}))[m
